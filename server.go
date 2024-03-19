@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dgrijalva/jwt-go"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type Gender string
@@ -67,6 +67,7 @@ type Users struct {
 	Name     string `json:"name"`
 	Mail     string `json:"mail"`
 	Password string `json:"password"`
+	Role     string `json:"role"`
 }
 
 func newFilmWithDefaultRating() Film {
@@ -76,13 +77,20 @@ func newFilmWithDefaultRating() Film {
 func handler() {
 	conf := newConf()
 	connect := connect(conf)
-	http.HandleFunc("/", authorization(connect))
-	http.Handle("/actor", checkToken(actorHandler(connect)))
-	http.HandleFunc("/film", filmHandler(connect))
-	http.HandleFunc("/health", healthCheckHandler)
+	mx := http.NewServeMux()
+	srv := &http.Server{
+		Addr:    conf.Server,
+		Handler: mx,
+	}
 
-	log.Printf("Сервер %s работает. Порт:%s", conf.ServerHost, conf.ServerPort)
-	err := http.ListenAndServe(conf.ServerHost+":"+conf.ServerPort, nil)
+	mx.HandleFunc("/user", user(connect))
+	mx.HandleFunc("/actor", actorHandler(connect))
+	mx.HandleFunc("/film", filmHandler(connect))
+	mx.HandleFunc("/health", healthCheckHandler)
+	mx.HandleFunc("/user/login", userLogin(connect))
+
+	log.Printf("Сервер %s работает.", conf.Server)
+	err := srv.ListenAndServe()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -636,10 +644,83 @@ func searchNewFilm(connect *sql.DB, r *http.Request) ([]SearchFilm, error) {
 
 //////////////////////////////////////////////////
 
-func authorization(connect *sql.DB) http.HandlerFunc {
+func user(connect *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
-		case http.MethodGet:
+		case http.MethodPut:
+			authorizationUsers(connect, w, r)
+		case http.MethodPost:
+			createUser(connect, w, r)
+		default:
+			http.Error(w, "Не правильный http метод", http.StatusMethodNotAllowed)
+		}
+	}
+}
+
+func createUser(connect *sql.DB, w http.ResponseWriter, r *http.Request) {
+	var newUser Users
+	err := json.NewDecoder(r.Body).Decode(&newUser)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusMethodNotAllowed)
+		return
+	}
+
+	//valid
+	validName := []rune("0123456789")
+
+	for _, val := range validName {
+		if strings.Contains(newUser.Name, string(val)) {
+			fmt.Println(errors.New("Некорректно введено имя. Введите имя без чисел."))
+			return
+		}
+	}
+
+	if strings.Contains(newUser.Mail, "@") == false {
+		fmt.Println(errors.New("Некорректно введен mail"))
+		return
+	}
+
+	id, err := createNewUser(connect, newUser)
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+
+	response := map[string]int{
+		"id": id,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func createNewUser(connect *sql.DB, newUser Users) (int, error) {
+	hashPassword := hashPassword(newUser.Password)
+	user := connect.QueryRow(fmt.Sprintf(`INSERT INTO "users" ("name","mail","password", "role") VALUES('%s','%s','%s','%s') RETURNING "id" `, newUser.Name, newUser.Mail, hashPassword, newUser.Role))
+	var id int
+
+	if err := user.Scan(&id); err != nil {
+		return 0, err
+	}
+
+	return id, nil
+}
+
+func hashPassword(password string) []byte {
+	pass := []byte(password)
+	cost := 10
+	hashpassword, err := bcrypt.GenerateFromPassword(pass, cost)
+	if err != nil {
+		fmt.Println(err.Error())
+	}
+
+	return hashpassword
+}
+
+func userLogin(connect *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
 			authorizationUsers(connect, w, r)
 		default:
 			http.Error(w, "Не правильный http метод", http.StatusMethodNotAllowed)
@@ -655,76 +736,30 @@ func authorizationUsers(connect *sql.DB, w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	token, err := isThereAUser(connect, u)
+	id, err := isThereAUser(connect, u)
 	if err != nil {
 		fmt.Println(err.Error())
 		return
 	}
-	isThereAUser(connect, u)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(token)
+	json.NewEncoder(w).Encode(id)
 }
 
-func isThereAUser(connect *sql.DB, u Users) (string, error) {
-
-	authorization := connect.QueryRow(fmt.Sprintf(`SELECT "id" FROM "users" WHERE "mail" = '%s' AND "password"='%s' `, u.Mail, u.Password))
-
+func isThereAUser(connect *sql.DB, u Users) (int, error) {
 	var id int
-	var err error
-	if err := authorization.Scan(&id); err != nil {
-		return "", err
-	}
-	if id == 0 {
-		return "", err
-	}
-
-	tocen, err := validJWT()
-	if err != nil {
-		return "", err
-	}
-
-	return tocen, err
-}
-
-func validJWT() (string, error) {
-	tocen := jwt.New(jwt.SigningMethodHS512)
-
-	claims := tocen.Claims.(jwt.MapClaims)
-
-	claims["exp"] = time.Now().Add(time.Hour * 1).Unix()
-
-	tocenString, err := tocen.SignedString(myKey)
+	var password string
+	user := connect.QueryRow(fmt.Sprintf(`SELECT "id","password" FROM "users" WHERE "mail" = '%s' `, u.Mail))
+	err := user.Scan(&id, &password)
 	if err != nil {
 		fmt.Println(err.Error())
 	}
 
-	return tocenString, err
-}
-
-func checkToken(endpoint func(http.ResponseWriter, *http.Request)) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
-		if r.Header["Token"] != nil {
-
-			token, err := jwt.Parse(r.Header["Token"][0], func(token *jwt.Token) (interface{}, error) {
-				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-					return nil, fmt.Errorf("There was an error")
-				}
-				return myKey, nil
-			})
-
-			if err != nil {
-				fmt.Fprintf(w, err.Error())
-			}
-
-			if token.Valid {
-				endpoint(w, r)
-			}
-		} else {
-
-			fmt.Fprintf(w, "Not Authorized")
-		}
-	})
+	err = bcrypt.CompareHashAndPassword([]byte(password), []byte(u.Password))
+	if err != nil {
+		fmt.Println(err.Error())
+		return 0, err
+	}
+	return id, err
 }
 
 func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
