@@ -7,8 +7,7 @@ import (
 )
 
 type setting struct {
-	ServerHost string
-	ServerPort string
+	Server     string
 	PgHost     string
 	PgPort     string
 	PgUser     string
