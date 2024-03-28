@@ -83,11 +83,11 @@ func handler() {
 		Handler: mx,
 	}
 
-	mx.HandleFunc("/user", user(connect))
-	mx.HandleFunc("/actor", actorHandler(connect))
-	mx.HandleFunc("/film", filmHandler(connect))
+	mx.Handle("/user", user(connect))
+	mx.Handle("/actor", authMiddleWare(actorHandler(connect)))
+	mx.Handle("/film", filmHandler(connect))
 	mx.HandleFunc("/health", healthCheckHandler)
-	mx.HandleFunc("/user/login", userLogin(connect))
+	mx.Handle("/user/login", userLogin(connect))
 
 	log.Printf("Сервер %s работает.", conf.Server)
 	err := srv.ListenAndServe()
@@ -96,7 +96,23 @@ func handler() {
 	}
 }
 
+func authMiddleWare(endpoint func(http.ResponseWriter, *http.Request)) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		validToken := "adminGena"
+		token := r.Header["Authorization"]
+		fmt.Println(token)
+		err := bcrypt.CompareHashAndPassword([]byte(token[0]), []byte(validToken))
+		if err != nil {
+			fmt.Println(err.Error())
+		}
+		if err == nil {
+			endpoint(w, r)
+		}
+	})
+}
+
 func actorHandler(connect *sql.DB) http.HandlerFunc {
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodDelete:
@@ -334,6 +350,7 @@ func receivingNewActor(connect *sql.DB) ([]ReceivingActor, error) {
 ///////////////////////////////////////////////////////////////
 
 func filmHandler(connect *sql.DB) http.HandlerFunc {
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -736,20 +753,21 @@ func authorizationUsers(connect *sql.DB, w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	id, err := isThereAUser(connect, u)
+	password, err := isThereAUser(connect, u)
 	if err != nil {
 		fmt.Println(err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(id)
+	json.NewEncoder(w).Encode(password)
 }
 
-func isThereAUser(connect *sql.DB, u Users) (int, error) {
-	var id int
+func isThereAUser(connect *sql.DB, u Users) (map[string]string, error) {
 	var password string
-	user := connect.QueryRow(fmt.Sprintf(`SELECT "id","password" FROM "users" WHERE "mail" = '%s' `, u.Mail))
-	err := user.Scan(&id, &password)
+	var name string
+	var role string
+	user := connect.QueryRow(fmt.Sprintf(`SELECT "password", "name", "role" FROM "users" WHERE "mail" = '%s' `, u.Mail))
+	err := user.Scan(&password, &name, &role)
 	if err != nil {
 		fmt.Println(err.Error())
 	}
@@ -757,9 +775,26 @@ func isThereAUser(connect *sql.DB, u Users) (int, error) {
 	err = bcrypt.CompareHashAndPassword([]byte(password), []byte(u.Password))
 	if err != nil {
 		fmt.Println(err.Error())
-		return 0, err
+		return nil, err
 	}
-	return id, err
+
+	token := map[string]string{
+		"token": string(tokeen(role, name)),
+	}
+
+	return token, err
+}
+
+func tokeen(role, name string) []byte {
+	roleName := role + name
+	rN := []byte(roleName)
+	cost := 10
+	token, err := bcrypt.GenerateFromPassword(rN, cost)
+	if err != nil {
+		fmt.Println(err.Error())
+	}
+
+	return token
 }
 
 func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
